@@ -1,5 +1,6 @@
 import io
 import sys
+import os
 import asyncio
 import time
 import json
@@ -31,7 +32,7 @@ OUTPUT_DIR = Path("ocr_results")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 MODEL_ID = "lightonai/LightOnOCR-2-1B"
-JSON_MODEL_ID = "microsoft/Phi-3.5-mini-instruct"
+JSON_MODEL_ID = os.getenv("JSON_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
 MAX_NEW_TOKENS = 512
 
 app = FastAPI(title="LightOnOCR CPU Server")
@@ -49,6 +50,7 @@ model = None
 json_tokenizer = None
 json_model = None
 json_chain = None
+json_llm_chain = None
 json_format_instructions = None
 json_parser = None
 json_prompt = None
@@ -128,37 +130,65 @@ def extract_json_block(text: str) -> dict | None:
         return None
 
 
-def generate_contact_json(raw_text: str) -> tuple[dict | None, str | None]:
-    """Use LangChain pipeline to transform OCR text into structured JSON."""
+def _coerce_helper_output(helper_result) -> str:
+    """Normalize LangChain/HF outputs into plain text"""
 
-    if json_chain is None or json_parser is None or json_format_instructions is None:
+    if helper_result is None:
+        return ""
+
+    if isinstance(helper_result, str):
+        return helper_result
+
+    if isinstance(helper_result, dict):
+        if "generated_text" in helper_result:
+            return helper_result["generated_text"]
+        if "text" in helper_result:
+            return helper_result["text"]
+
+    content = getattr(helper_result, "content", None)
+    if isinstance(content, str):
+        return content
+
+    return str(helper_result)
+
+
+def generate_contact_json(raw_text: str) -> tuple[dict | None, str | None]:
+    """Use helper LLM to coerce OCR text into structured JSON."""
+
+    if (
+        json_llm_chain is None
+        or json_parser is None
+        or json_format_instructions is None
+    ):
         return None, None
 
+    helper_raw_text = None
     try:
-        structured = json_chain.invoke(
+        helper_result = json_llm_chain.invoke(
             {
                 "raw_text": raw_text,
                 "format_instructions": json_format_instructions,
             }
         )
+        helper_raw_text = _coerce_helper_output(helper_result).strip()
 
-        if isinstance(structured, ContactPayload):
-            structured_dict = structured.dict()
-        elif isinstance(structured, dict):
-            structured_dict = structured
-        else:
+        if not helper_raw_text:
             return None, None
 
-        return structured_dict, json.dumps(structured_dict, ensure_ascii=False)
+        structured = json_parser.parse(helper_raw_text)
+        structured_dict = structured.dict() if isinstance(structured, ContactPayload) else structured
+        return structured_dict, helper_raw_text
     except OutputParserException:
-        return None, None
+        fallback = extract_json_block(helper_raw_text or "")
+        return fallback, helper_raw_text
     except Exception:
-        return None, None
+        fallback = extract_json_block(helper_raw_text or "")
+        return fallback, helper_raw_text
 
 
 @app.on_event("startup")
 async def load_model():
-    global processor, model, json_tokenizer, json_model, json_chain, json_format_instructions, json_parser, json_prompt
+    global processor, model, json_tokenizer, json_model, json_chain, json_llm_chain, json_format_instructions, json_parser, json_prompt
 
     print("🔹 Loading processor...")
     processor = LightOnOcrProcessor.from_pretrained(MODEL_ID)
@@ -175,14 +205,26 @@ async def load_model():
     print("✅ Model ready")
 
     print(f"🔹 Loading JSON helper model ({JSON_MODEL_ID})...")
-    json_tokenizer = AutoTokenizer.from_pretrained(JSON_MODEL_ID)
+    helper_on_cuda = torch.cuda.is_available()
+    helper_dtype = torch.float16 if helper_on_cuda else torch.float32
+
+    json_tokenizer = AutoTokenizer.from_pretrained(
+        JSON_MODEL_ID,
+        trust_remote_code=True,
+    )
     if json_tokenizer.pad_token is None:
         json_tokenizer.pad_token = json_tokenizer.eos_token
+    model_kwargs = {
+        "torch_dtype": helper_dtype,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+    }
+    if helper_on_cuda:
+        model_kwargs["device_map"] = "auto"
+
     json_model = AutoModelForCausalLM.from_pretrained(
         JSON_MODEL_ID,
-        torch_dtype=torch.float32,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
+        **model_kwargs,
     )
     json_model.eval()
 
@@ -195,10 +237,21 @@ async def load_model():
             ),
             (
                 "user",
-                "Extract contact information from the following OCR text.\n\nRAW OCR INPUT:\n{raw_text}\n\nFollow this JSON schema exactly:\n{format_instructions}",
+                (
+                    "Extract contact information from the following OCR text.\n\n"
+                    "RAW OCR INPUT:\n{raw_text}\n\n"
+                    "Rules:\n"
+                    "1. Respond with JSON only.\n"
+                    "2. Populate every field defined in the schema (use null or [] when missing).\n"
+                    "3. Always wrap property names and string values with double quotes.\n"
+                    "4. Never include markdown fences or prose.\n\n"
+                    "Schema to follow exactly:\n{format_instructions}"
+                ),
             ),
         ]
     )
+
+    pipeline_device = 0 if helper_on_cuda else -1
 
     generation_pipeline = hf_pipeline(
         "text-generation",
@@ -209,9 +262,11 @@ async def load_model():
         do_sample=False,
         pad_token_id=json_tokenizer.pad_token_id,
         return_full_text=False,
+        device=pipeline_device,
     )
     llm = HuggingFacePipeline(pipeline=generation_pipeline)
-    json_chain = prompt | llm | parser
+    json_llm_chain = prompt | llm
+    json_chain = json_llm_chain
     json_parser = parser
     json_format_instructions = parser.get_format_instructions()
     json_prompt = prompt
