@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local environment files
+.env
+.env.*
+.python-version
+
+# OCR output artifacts
+ocr_results/
+
+# Frontend build artifacts
+webapp/node_modules/
+webapp/.next/
+webapp/.turbo/
+webapp/.env.local
