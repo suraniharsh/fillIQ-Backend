@@ -1,22 +1,18 @@
 import io
 import sys
 import os
+import re
 import asyncio
 import time
 import json
-import base64
 from pathlib import Path
 from datetime import datetime
 import torch
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import re
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.exceptions import OutputParserException
-from langchain_core.output_parsers import PydanticOutputParser
 from langchain_community.llms import HuggingFacePipeline
-from pydantic import BaseModel, Field
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -35,6 +31,8 @@ MODEL_ID = "lightonai/LightOnOCR-2-1B"
 JSON_MODEL_ID = os.getenv("JSON_MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
 MAX_NEW_TOKENS = 512
 
+torch.set_num_threads(max(1, (os.cpu_count() or 1) - 1))
+
 app = FastAPI(title="LightOnOCR CPU Server")
 
 app.add_middleware(
@@ -49,45 +47,25 @@ processor = None
 model = None
 json_tokenizer = None
 json_model = None
-json_chain = None
 json_llm_chain = None
-json_format_instructions = None
-json_parser = None
-json_prompt = None
 
-
-class ContactBlock(BaseModel):
-    name: str | None = Field(None, description="Full name on the card")
-    role: str | None = Field(None, description="Job title or role")
-    company: str | None = Field(None, description="Company or organization name")
-
-
-class CommunicationBlock(BaseModel):
-    phones: list[str] = Field(default_factory=list)
-    emails: list[str] = Field(default_factory=list)
-    website: str | None = None
-
-
-class LocationBlock(BaseModel):
-    address: str | None = None
-
-
-class BrandingBlock(BaseModel):
-    logo_text: str | None = None
-    brand_notes: str | None = None
-
-
-class ConfidenceBlock(BaseModel):
-    score: float | None = Field(None, description="Confidence score between 0 and 1")
-    notes: str | None = None
-
-
-class ContactPayload(BaseModel):
-    contact: ContactBlock
-    communications: CommunicationBlock
-    location: LocationBlock
-    branding: BrandingBlock
-    confidence: ConfidenceBlock
+# The exact flat schema we want from the helper LLM
+EMPTY_CONTACT = {
+    "salutation": "",
+    "first_name": "",
+    "last_name": "",
+    "gender": "",
+    "email_id": "",
+    "mobile_no": "",
+    "no_of_employees": "",
+    "country": "",
+    "company_name": "",
+    "title": "",
+    "industry": "",
+    "city": "",
+    "state": "",
+    "status": "",
+}
 
 # simple in-process queue (prevents CPU dogpile)
 request_lock = asyncio.Lock()
@@ -117,8 +95,17 @@ class ProgressStreamer(TextStreamer):
             self.pbar.close()
 
 
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences and leading 'Assistant:' tags."""
+    text = re.sub(r"^\s*Assistant:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```\s*$", "", text)
+    return text.strip()
+
+
 def extract_json_block(text: str) -> dict | None:
     """Grab the first JSON object embedded in a string."""
+    text = _strip_fences(text)
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or start >= end:
@@ -130,65 +117,63 @@ def extract_json_block(text: str) -> dict | None:
         return None
 
 
-def _coerce_helper_output(helper_result) -> str:
-    """Normalize LangChain/HF outputs into plain text"""
+def normalize_contact(raw_dict: dict | None) -> dict:
+    """Force any dict into the flat contact schema with empty-string defaults."""
+    result = {k: "" for k in EMPTY_CONTACT}
+    if not raw_dict or not isinstance(raw_dict, dict):
+        return result
+    for key in EMPTY_CONTACT:
+        val = raw_dict.get(key)
+        if val is not None and val != "" and not isinstance(val, (dict, list)):
+            result[key] = str(val).strip()
+    return result
 
+
+def _coerce_helper_output(helper_result) -> str:
+    """Normalize LangChain/HF outputs into plain text."""
     if helper_result is None:
         return ""
-
     if isinstance(helper_result, str):
         return helper_result
-
     if isinstance(helper_result, dict):
         if "generated_text" in helper_result:
             return helper_result["generated_text"]
         if "text" in helper_result:
             return helper_result["text"]
-
     content = getattr(helper_result, "content", None)
     if isinstance(content, str):
         return content
-
     return str(helper_result)
 
 
-def generate_contact_json(raw_text: str) -> tuple[dict | None, str | None]:
-    """Use helper LLM to coerce OCR text into structured JSON."""
-
-    if (
-        json_llm_chain is None
-        or json_parser is None
-        or json_format_instructions is None
-    ):
-        return None, None
+def generate_contact_json(raw_text: str) -> tuple[dict, str | None]:
+    """Use Qwen helper to convert OCR text → flat contact JSON."""
+    if json_llm_chain is None:
+        return normalize_contact(None), None
 
     helper_raw_text = None
     try:
-        helper_result = json_llm_chain.invoke(
-            {
-                "raw_text": raw_text,
-                "format_instructions": json_format_instructions,
-            }
-        )
+        helper_result = json_llm_chain.invoke({"raw_text": raw_text})
         helper_raw_text = _coerce_helper_output(helper_result).strip()
-
         if not helper_raw_text:
-            return None, None
+            return normalize_contact(None), None
+        parsed = extract_json_block(helper_raw_text)
+        return normalize_contact(parsed), helper_raw_text
+    except Exception as exc:
+        print(f"⚠️  Helper LLM error: {exc}")
+        parsed = extract_json_block(helper_raw_text or "")
+        return normalize_contact(parsed), helper_raw_text
 
-        structured = json_parser.parse(helper_raw_text)
-        structured_dict = structured.dict() if isinstance(structured, ContactPayload) else structured
-        return structured_dict, helper_raw_text
-    except OutputParserException:
-        fallback = extract_json_block(helper_raw_text or "")
-        return fallback, helper_raw_text
-    except Exception:
-        fallback = extract_json_block(helper_raw_text or "")
-        return fallback, helper_raw_text
+
+
+
+# Concrete example the 0.5B model can copy
+_EXAMPLE_JSON = json.dumps(EMPTY_CONTACT, indent=2)
 
 
 @app.on_event("startup")
 async def load_model():
-    global processor, model, json_tokenizer, json_model, json_chain, json_llm_chain, json_format_instructions, json_parser, json_prompt
+    global processor, model, json_tokenizer, json_model, json_llm_chain
 
     print("🔹 Loading processor...")
     processor = LightOnOcrProcessor.from_pretrained(MODEL_ID)
@@ -198,9 +183,8 @@ async def load_model():
         MODEL_ID,
         torch_dtype=torch.float32,
         device_map="cpu",
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
     )
-
     model.eval()
     print("✅ Model ready")
 
@@ -214,6 +198,7 @@ async def load_model():
     )
     if json_tokenizer.pad_token is None:
         json_tokenizer.pad_token = json_tokenizer.eos_token
+
     model_kwargs = {
         "torch_dtype": helper_dtype,
         "low_cpu_mem_usage": True,
@@ -228,25 +213,21 @@ async def load_model():
     )
     json_model.eval()
 
-    parser = PydanticOutputParser(pydantic_object=ContactPayload)
+    # Simple, concrete prompt the 0.5B model can actually follow
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "You are an expert data extraction assistant. Convert business-card OCR text into the requested JSON schema. Always reply with valid JSON only.",
+                (
+                    "You extract contact info from business card text into JSON. "
+                    "Reply with ONLY a JSON object, no extra text.\n"
+                    "Use EXACTLY these keys (use empty string \"\" when not found):\n"
+                    f"{_EXAMPLE_JSON}"
+                ),
             ),
             (
                 "user",
-                (
-                    "Extract contact information from the following OCR text.\n\n"
-                    "RAW OCR INPUT:\n{raw_text}\n\n"
-                    "Rules:\n"
-                    "1. Respond with JSON only.\n"
-                    "2. Populate every field defined in the schema (use null or [] when missing).\n"
-                    "3. Always wrap property names and string values with double quotes.\n"
-                    "4. Never include markdown fences or prose.\n\n"
-                    "Schema to follow exactly:\n{format_instructions}"
-                ),
+                "Business card text:\n{raw_text}\n\nJSON:",
             ),
         ]
     )
@@ -266,10 +247,6 @@ async def load_model():
     )
     llm = HuggingFacePipeline(pipeline=generation_pipeline)
     json_llm_chain = prompt | llm
-    json_chain = json_llm_chain
-    json_parser = parser
-    json_format_instructions = parser.get_format_instructions()
-    json_prompt = prompt
     print("✅ JSON helper ready")
 
 
@@ -296,30 +273,19 @@ async def run_ocr(file: UploadFile = File(...)):
 
     print(f"📥 Received image: {file.filename} ({image.size[0]}x{image.size[1]})")
 
-    # Convert image to base64 data URI
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-    image_uri = f"data:image/png;base64,{image_base64}"
-
-    # Prompt chain to encourage structured JSON output
-    prompt_chain = [
-        "Please extract the text from the image, identifying labels and values for name, company, mobile number, email, address, role, and any logos or brand signals. Return only a JSON object with keys that match these pieces of information (use snake_case if unsure).",
-        "Double-check the extracted information and respond with a clean JSON payload that includes: contact (name, company, role), communications (phones, emails), location (address), branding (logo_text, brand_notes), and confidence hints. If no data exists for a field, set it to null or an empty array. Do not prepend or append any prose."
-    ]
-
     conversation = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt_chain[0]},
-                {"type": "image", "url": image_uri},
-            ],
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt_chain[1]},
+                {"type": "image", "image": image},
+                {
+                    "type": "text",
+                    "text": (
+                        "Extract ALL text from this business card. "
+                        "Include every name, title, company, phone, email, "
+                        "address, and website you can see. Return plain text only."
+                    ),
+                },
             ],
         },
     ]
@@ -357,18 +323,14 @@ async def run_ocr(file: UploadFile = File(...)):
         elapsed = time.time() - start_time
         print(f"✅ Done in {elapsed:.2f}s")
 
+    # Always run Qwen helper to convert raw text → flat contact JSON
+    print("🔄 Running Qwen helper...")
+    structured_json, helper_raw = generate_contact_json(text)
+
     # Save result to file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_filename = Path(file.filename or "unknown").stem
     result_file = OUTPUT_DIR / f"{timestamp}_{safe_filename}.json"
-    
-    # Try to read JSON directly from model output, otherwise synthesize via helper LLM
-    structured_json = extract_json_block(text)
-    helper_raw_json = None
-    if structured_json is None:
-        structured_json, helper_raw_json = generate_contact_json(text)
-    else:
-        helper_raw_json = json.dumps(structured_json)
 
     result_data = {
         "timestamp": datetime.now().isoformat(),
@@ -377,14 +339,14 @@ async def run_ocr(file: UploadFile = File(...)):
         "processing_time_seconds": round(elapsed, 2),
         "raw_text": text,
         "structured_json": structured_json,
-        "json_helper_output": helper_raw_json,
+        "json_helper_output": helper_raw,
     }
-    
+
     result_file.write_text(json.dumps(result_data, indent=2, ensure_ascii=False))
     print(f"💾 Saved to {result_file}")
 
     return {
         "raw_text": text,
         "structured_json": structured_json,
-        "json_helper_output": helper_raw_json,
+        "json_helper_output": helper_raw,
     }
